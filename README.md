@@ -13,7 +13,7 @@ python -m pip install -r requirements.txt
 python mysql_failover_timing.py
 ```
 
-Open <http://127.0.0.1:5000>, provide both database addresses and MySQL credentials, then start the observer. The default sampling interval is 0.25 seconds; MySQL is contacted on port 3306 unless changed in the form.
+Open <http://127.0.0.1:5050>, provide both database addresses and MySQL credentials, then start the observer. The default sampling interval is 0.25 seconds; MySQL is contacted on port 3306 unless changed in the form.
 
 ## Recorded signals
 

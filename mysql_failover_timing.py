@@ -3,7 +3,7 @@
 
 Install: python -m pip install -r requirements.txt
 Run:     python mysql_failover_timing.py
-Open:    http://127.0.0.1:5000
+Open:    http://127.0.0.1:5050
 
 This app only observes two MySQL servers.  It never executes a switchover.
 Clicking "Start switchover timing" records the external-operation start time.
@@ -33,6 +33,8 @@ class ServerStatus:
     ip: str
     connected: bool = False
     hostname: str = "—"
+    uptime_seconds: int | None = None
+    uptime_error: str = ""
     read_only: bool | None = None
     replication: str = "Unknown / not available"
     replication_channels: dict[str, str] = field(default_factory=dict)
@@ -81,6 +83,19 @@ class DualMonitor:
                 with con.cursor() as cur:
                     cur.execute("SELECT @@hostname, @@global.read_only, COALESCE(@@global.super_read_only, 0)")
                     hostname, ro, super_ro = cur.fetchone()
+                    # Uptime is a standard global status counter, so it remains
+                    # useful even where replication-status access is restricted.
+                    uptime_seconds: int | None = None
+                    uptime_error = ""
+                    try:
+                        cur.execute("SHOW GLOBAL STATUS LIKE 'Uptime'")
+                        uptime_row = cur.fetchone()
+                        if uptime_row:
+                            uptime_seconds = int(uptime_row[1])
+                        else:
+                            uptime_error = "The server did not return its Uptime status value."
+                    except Exception as exc:
+                        uptime_error = f"{type(exc).__name__}: {exc}"
                     # MySQL 8+ exposes channels here.  If permissions/version do not
                     # permit it, the dashboard reports that fact without failing.
                     channels_by_name: dict[str, str] = {}
@@ -108,7 +123,9 @@ class DualMonitor:
                             replication = ", ".join(f"{name}: {status}" for name, status in channels_by_name.items()) or "No replication channels"
                         except Exception:
                             replication = "Not available (version or privileges)"
-                    return ServerStatus(ip=ip, connected=True, hostname=str(hostname), read_only=bool(ro or super_ro),
+                    return ServerStatus(ip=ip, connected=True, hostname=str(hostname), uptime_seconds=uptime_seconds,
+                        uptime_error=uptime_error,
+                        read_only=bool(ro or super_ro),
                         replication=replication, replication_channels=channels_by_name,
                         replication_available=replication_available, observed_at=iso_now())
             finally:
@@ -181,7 +198,7 @@ body{font:15px system-ui;margin:2rem;max-width:1120px;color:#172033}input{paddin
 <h1>MySQL switchover observer</h1><p>Observes two database IPs. The switchover itself is managed externally.</p>
 <form id="config"><input name="primary_ip" placeholder="Current primary IP" required><input name="target_ip" placeholder="Target DB IP" required><input name="user" placeholder="MySQL user" required><input name="password" type="password" placeholder="Password" required><input name="database" placeholder="Database optional"><input name="port" type="number" value="3306"><input name="interval" type="number" step=".05" value="0.25"><button>Start observer</button></form>
 <p><button class="danger" onclick="mark()">Start switchover timing</button> <button onclick="stop()">Stop observer</button> <span id="run"></span></p><div class="cards" id="servers"></div><h2>Timings after button click</h2><div id="timings"></div><h2>Events</h2><table><thead><tr><th>UTC</th><th>After switch</th><th>Server</th><th>Event</th><th>Detail</th></tr></thead><tbody id="events"></tbody></table>
-<script>const esc=s=>String(s??'—').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));const sec=x=>x==null?'—':Number(x).toFixed(3)+' s';async function api(u,o){let r=await fetch(u,o);let j=await r.json();if(!r.ok)alert(j.error||'Request failed');return j}document.querySelector('#config').onsubmit=async e=>{e.preventDefault();let d=Object.fromEntries(new FormData(e.target));await api('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});refresh()};async function mark(){await api('/api/mark-switch',{method:'POST'});refresh()}async function stop(){await api('/api/stop',{method:'POST'});refresh()}function card(title,s){return `<section class="card"><h2>${title}</h2><div><b>IP:</b> ${esc(s.ip)}</div><div class="${s.connected?'ok':'bad'}"><b>Status:</b> ${s.connected?'CONNECTED':'NO CONNECTION'}</div><div><b>Hostname:</b> ${esc(s.hostname)}</div><div><b>Read-only:</b> ${s.read_only==null?'—':s.read_only?'YES':'NO (RW)'}</div><div><b>Replication channels:</b> ${esc(s.replication)}</div>${s.error?`<div class="bad">${esc(s.error)}</div>`:''}<small>Last sample: ${esc(s.observed_at)}</small></section>`}function label(k){let labels={primary_connection_lost:'Primary connection lost',primary_connection_restored:'Primary connection restored',primary_hostname_changed:'Primary hostname changed',primary_read_write:'Primary writable',target_connection_lost:'Target connection lost',target_connection_restored:'Target connection restored',target_hostname_changed:'Target hostname changed',target_read_write:'Target writable'};return labels[k]||k.replace('_channel_deleted:',' replication channel deleted: ').replaceAll('_',' ')}async function refresh(){let s=await api('/api/status');document.querySelector('#run').textContent=s.running?'Observer running':'Observer stopped';document.querySelector('#servers').innerHTML=card('Current primary',s.servers.primary)+card('Target DB',s.servers.target);document.querySelector('#timings').innerHTML=s.switch_started?Object.entries(s.timings).map(([k,v])=>`<div class="metric"><b>${esc(label(k))}:</b> ${sec(v)}</div>`).join('')||'<div class="metric">Waiting for switchover events…</div>':'Click “Start switchover timing” when the external switchover begins.';document.querySelector('#events').innerHTML=s.events.map(e=>`<tr><td>${esc(e.timestamp_utc)}</td><td>${sec(e.seconds_from_switch)}</td><td>${esc(e.server)}</td><td>${esc(e.event)}</td><td>${esc(e.detail)}</td></tr>`).join('')}setInterval(refresh,500);refresh();</script></body></html>'''
+<script>const esc=s=>String(s??'—').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));const sec=x=>x==null?'—':Number(x).toFixed(3)+' s';const uptime=x=>{if(x==null)return '—';let n=Math.max(0,Number(x)),d=Math.floor(n/86400),h=Math.floor(n%86400/3600),m=Math.floor(n%3600/60),s=Math.floor(n%60);return (d?d+'d ':'')+String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')};async function api(u,o){let r=await fetch(u,o);let j=await r.json();if(!r.ok)alert(j.error||'Request failed');return j}document.querySelector('#config').onsubmit=async e=>{e.preventDefault();let d=Object.fromEntries(new FormData(e.target));await api('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)});refresh()};async function mark(){await api('/api/mark-switch',{method:'POST'});refresh()}async function stop(){await api('/api/stop',{method:'POST'});refresh()}function card(title,s){return `<section class="card"><h2>${title}</h2><div><b>IP:</b> ${esc(s.ip)}</div><div class="${s.connected?'ok':'bad'}"><b>Status:</b> ${s.connected?'CONNECTED':'NO CONNECTION'}</div><div><b>Hostname:</b> ${esc(s.hostname)}</div><div><b>Uptime:</b> ${esc(uptime(s.uptime_seconds))}</div><div><b>Read-only:</b> ${s.read_only==null?'—':s.read_only?'YES':'NO (RW)'}</div><div><b>Replication channels:</b> ${esc(s.replication)}</div>${s.error?`<div class="bad">${esc(s.error)}</div>`:''}<small>Last sample: ${esc(s.observed_at)}</small></section>`}function label(k){let labels={primary_connection_lost:'Primary connection lost',primary_connection_restored:'Primary connection restored',primary_hostname_changed:'Primary hostname changed',primary_read_write:'Primary writable',target_connection_lost:'Target connection lost',target_connection_restored:'Target connection restored',target_hostname_changed:'Target hostname changed',target_read_write:'Target writable'};return labels[k]||k.replace('_channel_deleted:',' replication channel deleted: ').replaceAll('_',' ')}async function refresh(){let s=await api('/api/status');document.querySelector('#run').textContent=s.running?'Observer running':'Observer stopped';document.querySelector('#servers').innerHTML=card('Current primary',s.servers.primary)+card('Target DB',s.servers.target);document.querySelector('#timings').innerHTML=s.switch_started?Object.entries(s.timings).map(([k,v])=>`<div class="metric"><b>${esc(label(k))}:</b> ${sec(v)}</div>`).join('')||'<div class="metric">Waiting for switchover events…</div>':'Click “Start switchover timing” when the external switchover begins.';document.querySelector('#events').innerHTML=s.events.map(e=>`<tr><td>${esc(e.timestamp_utc)}</td><td>${sec(e.seconds_from_switch)}</td><td>${esc(e.server)}</td><td>${esc(e.event)}</td><td>${esc(e.detail)}</td></tr>`).join('')}setInterval(refresh,500);refresh();</script></body></html>'''
 
 @app.get("/")
 def index(): return PAGE
@@ -213,5 +230,5 @@ def stop():
 def status(): return jsonify(monitor.snapshot() if monitor else {"running": False, "switch_started": False, "servers": {"primary": asdict(ServerStatus("—")), "target": asdict(ServerStatus("—"))}, "events": [], "timings": {}})
 
 if __name__ == "__main__":
-    cli = argparse.ArgumentParser(); cli.add_argument("--port", type=int, default=5000); args = cli.parse_args()
+    cli = argparse.ArgumentParser(); cli.add_argument("--port", type=int, default=5050); args = cli.parse_args()
     app.run(host="127.0.0.1", port=args.port, debug=False)
