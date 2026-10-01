@@ -1,21 +1,20 @@
 # Bluegreen Observer
 
-A small local Flask dashboard for observing and timing an externally managed MySQL blue/green switchover. It monitors a current primary and a target database, recording connection changes, read-only transitions, hostname changes, and replication-channel events.
+Local Flask dashboards for watching MySQL servers during an externally managed blue/green switchover. Both dashboards only query MySQL; neither initiates or changes a switchover.
 
-The observer never initiates, configures, or alters a switchover. Use **Start switchover timing** when the external operation begins.
-
-## Run locally
+## Install
 
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -r requirements.txt
-python mysql_failover_timing.py
 ```
 
-Open <http://127.0.0.1:5050>, provide both database addresses and MySQL credentials, then start the observer. The default sampling interval is 0.25 seconds; MySQL is contacted on port 3306 unless changed in the form.
+## Two-server switchover timer
 
-## Recorded signals
+Run `python mysql_failover_timing.py` and open <http://127.0.0.1:5050>. Enter the current primary and target addresses and MySQL credentials, then start the observer. Click **Start switchover timing** when the external operation begins to measure subsequent events. The default sample interval is 0.25 seconds, and the default MySQL port is 3306.
+
+The timer records:
 
 - Initial connectivity, hostname, and read-only state for each server
 - Connection loss and restoration
@@ -23,4 +22,10 @@ Open <http://127.0.0.1:5050>, provide both database addresses and MySQL credenti
 - Hostname changes
 - Replication-channel creation, deletion, and state changes, when available
 
-Depending on MySQL version and account privileges, replication status may not be available. Connection errors are shown in the dashboard and do not stop monitoring the other server.
+Depending on MySQL version and account privileges, replication status may not be available. Connection errors appear in the dashboard.
+
+## Multi-server observer
+
+Run `python mysql_multi_observer.py` and open <http://127.0.0.1:5051>. Add 1–16 distinct DB servers, enter shared MySQL credentials, and choose **Load tables** to list `performance_schema` tables from the first reachable server. Select 1–8 tables, then click **Start observe**. The default sample interval is one second; each server can use its own MySQL port.
+
+The left panel shows each server's connection state, hostname, read-only state, uptime, replication channels, and `@@GLOBAL.gtid_executed` value. The right panel shows timestamped connection, hostname, read-only, GTID, replication, table-content, and uptime reset events above the selected table content. Each server's status and table content share a distinct color. Routine uptime increments do not create events. Each table displays up to 50 sampled rows. The account needs permission to read the selected tables; table errors appear in the dashboard without stopping observation of the other servers.
