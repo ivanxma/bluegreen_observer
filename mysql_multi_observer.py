@@ -7,6 +7,7 @@ This dashboard only reads from MySQL; it never performs a failover.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import threading
 import time
@@ -23,6 +24,7 @@ monitor: MultiMonitor | None = None
 IDENTIFIER = re.compile(r"^[A-Za-z0-9_]+$")
 ROW_LIMIT = 50
 EVENT_LIMIT = 1000
+PROPAGATION_LIMIT = 1000
 
 
 def now() -> str:
@@ -58,12 +60,33 @@ def cell(value: Any) -> Any:
     return str(value)[:500]
 
 
+def innodb_log_positions(storage_engines: Any) -> tuple[int | None, int | None]:
+    if isinstance(storage_engines, bytes):
+        storage_engines = storage_engines.decode("utf-8")
+    if isinstance(storage_engines, str):
+        storage_engines = json.loads(storage_engines)
+    engine = storage_engines.get("InnoDB") if isinstance(storage_engines, dict) else None
+    if not isinstance(engine, dict):
+        return None, None
+    lsn = engine.get("LSN")
+    checkpoint = engine.get("LSN_checkpoint")
+    return (int(lsn) if lsn is not None else None,
+            int(checkpoint) if checkpoint is not None else None)
+
+
 @dataclass
 class TableSample:
     columns: list[str] = field(default_factory=list)
     rows: list[list[Any]] = field(default_factory=list)
     error: str = ""
     observed_at: str = ""
+
+
+def table_values_changed(before: TableSample, after: TableSample) -> bool:
+    # A table read has no ORDER BY, so row order alone is not a content change.
+    return before.columns != after.columns or sorted(json.dumps(row) for row in before.rows) != sorted(
+        json.dumps(row) for row in after.rows
+    )
 
 
 @dataclass
@@ -77,6 +100,10 @@ class ServerSample:
     uptime_seconds: int | None = None
     gtid_executed: str = ""
     gtid_error: str = ""
+    server_uuid: str = ""
+    innodb_lsn: int | None = None
+    innodb_lsn_checkpoint: int | None = None
+    log_status_error: str = ""
     read_only: bool | None = None
     replication: str = "Unknown / not available"
     replication_channels: dict[str, str] = field(default_factory=dict)
@@ -102,6 +129,8 @@ class MultiMonitor:
                         for i, s in enumerate(config["servers"])]
         self.events: list[Event] = []
         self.last_connected: dict[str, ServerSample] = {}
+        self.primary_lsn: int | None = None
+        self.propagation_rows: list[dict[str, Any]] = []
         self.started = time.monotonic()
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
@@ -135,6 +164,16 @@ class MultiMonitor:
                         fresh.gtid_executed = str(row[0] or "") if row else ""
                     except Exception as exc:
                         fresh.gtid_error = f"{type(exc).__name__}: {exc}"
+                    try:
+                        cur.execute("SELECT SERVER_UUID, STORAGE_ENGINES FROM performance_schema.log_status")
+                        row = cur.fetchone()
+                        if row:
+                            fresh.server_uuid = str(row[0] or "")
+                            fresh.innodb_lsn, fresh.innodb_lsn_checkpoint = innodb_log_positions(row[1])
+                        else:
+                            fresh.log_status_error = "No log status returned"
+                    except Exception as exc:
+                        fresh.log_status_error = f"{type(exc).__name__}: {exc}"
                     try:
                         cur.execute("SELECT CHANNEL_NAME, SERVICE_STATE FROM performance_schema.replication_connection_status")
                         fresh.replication_channels = {str(name or "default"): str(state) for name, state in cur.fetchall()}
@@ -194,13 +233,56 @@ class MultiMonitor:
         for table, sample in fresh.tables.items():
             prior = old.tables.get(table)
             if not prior:
-                self.log(name, "table_ready" if not sample.error else "table_error", f"{table}: {sample.error or f'{len(sample.rows)} rows'}")
+                if sample.error:
+                    self.log(name, "table_error", f"{table}: {sample.error}")
             elif prior.error != sample.error:
                 self.log(name, "table_error" if sample.error else "table_restored", f"{table}: {sample.error or 'readable'}")
-            elif not sample.error and (prior.columns != sample.columns or prior.rows != sample.rows):
-                self.log(name, "table_changed", f"{table}: sampled rows {len(prior.rows)} → {len(sample.rows)}")
+            elif not sample.error and table_values_changed(prior, sample):
+                self.log(name, "table_changed", f"{table}: sampled content changed ({len(prior.rows)} → {len(sample.rows)} rows)")
         if fresh.connected:
             self.last_connected[fresh.id] = fresh
+
+    def update_propagation(self, sampled: dict[str, tuple[float, str]] | None = None) -> None:
+        sampled = sampled or {}
+        primary = self.servers[0]
+        if primary.connected and primary.innodb_lsn is not None:
+            current_lsn = primary.innodb_lsn
+            if self.primary_lsn is not None and current_lsn > self.primary_lsn:
+                started, sampled_at = sampled.get(primary.id, (time.monotonic(), now()))
+                for target in self.servers[1:]:
+                    self.propagation_rows.append({
+                        "primary_lsn": current_lsn,
+                        "primary_checkpoint": primary.innodb_lsn_checkpoint,
+                        "primary_seen_at": sampled_at,
+                        "target_id": target.id,
+                        "target_name": target.name,
+                        "target_lsn": target.innodb_lsn,
+                        "target_checkpoint": target.innodb_lsn_checkpoint,
+                        "target_seen_at": "",
+                        "latency_seconds": None,
+                        "status": "waiting",
+                        "started_monotonic": started,
+                    })
+                if len(self.propagation_rows) > PROPAGATION_LIMIT:
+                    del self.propagation_rows[:-PROPAGATION_LIMIT]
+            elif self.primary_lsn is not None and current_lsn < self.primary_lsn:
+                for row in self.propagation_rows:
+                    if row["status"] == "waiting":
+                        row["status"] = "primary LSN reset"
+            self.primary_lsn = current_lsn
+
+        targets = {server.id: server for server in self.servers[1:]}
+        for row in self.propagation_rows:
+            if row["status"] != "waiting":
+                continue
+            target = targets[row["target_id"]]
+            row["target_lsn"] = target.innodb_lsn
+            row["target_checkpoint"] = target.innodb_lsn_checkpoint
+            if target.connected and target.innodb_lsn is not None and target.innodb_lsn >= row["primary_lsn"]:
+                finished, observed_at = sampled.get(target.id, (time.monotonic(), now()))
+                row["status"] = "observed"
+                row["target_seen_at"] = observed_at
+                row["latency_seconds"] = round(max(0, finished - row["started_monotonic"]), 3)
 
     def run(self) -> None:
         with ThreadPoolExecutor(max_workers=min(len(self.servers), 16)) as pool:
@@ -210,13 +292,17 @@ class MultiMonitor:
                     originals = list(self.servers)
                 futures = {pool.submit(self.query, server): server.id for server in originals}
                 updates = {}
+                sampled = {}
                 for future in as_completed(futures):
-                    updates[futures[future]] = future.result()
+                    server_id = futures[future]
+                    updates[server_id] = future.result()
+                    sampled[server_id] = (time.monotonic(), now())
                 with self.lock:
                     for index, old in enumerate(self.servers):
                         fresh = updates[old.id]
                         self.evaluate(old, fresh)
                         self.servers[index] = fresh
+                    self.update_propagation(sampled)
                 self.stop_event.wait(max(0, self.config["interval"] - (time.monotonic() - began)))
 
     def start(self) -> None:
@@ -225,9 +311,21 @@ class MultiMonitor:
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
+            servers = [asdict(server) for server in self.servers]
+            for server in servers:
+                for field_name in ("innodb_lsn", "innodb_lsn_checkpoint"):
+                    if server[field_name] is not None:
+                        server[field_name] = str(server[field_name])
+            propagation_rows = [{key: value for key, value in row.items() if key != "started_monotonic"}
+                                for row in self.propagation_rows]
+            for row in propagation_rows:
+                for field_name in ("primary_lsn", "primary_checkpoint", "target_lsn", "target_checkpoint"):
+                    if row[field_name] is not None:
+                        row[field_name] = str(row[field_name])
             return {"running": bool(self.thread and self.thread.is_alive() and not self.stop_event.is_set()),
-                    "servers": [asdict(s) for s in self.servers],
+                    "servers": servers,
                     "events": [asdict(e) for e in self.events], "row_limit": ROW_LIMIT,
+                    "propagation_rows": propagation_rows,
                     "selected_tables": self.config["tables"]}
 
 
@@ -239,9 +337,14 @@ PAGE = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name
 .tablebox{background:hsl(var(--server-hue) 70% 99%)}
 .tablebox h3,.tablebox .datagrid th{background:hsl(var(--server-hue) 70% 92%)}
 .tablebox .datagrid tbody tr:nth-child(even){background:hsl(var(--server-hue) 70% 96%)}
+.propagation{margin-top:1rem}
+.propagation table{width:100%;border-collapse:collapse;font-size:.85rem}
+.propagation th,.propagation td{padding:.45rem;border-bottom:1px solid #e5e9ef;text-align:left;white-space:nowrap}
+.propagation th{background:#eef3f8;position:sticky;top:0}
 </style></head><body><header><h1>MySQL multi-server observer</h1><p>Read-only observation of server status and performance_schema tables.</p></header><main>
 <section class="config"><h2>Observer setup</h2><div id="serverInputs"></div><button type="button" id="addServer">Add DB server</button><div class="formgrid" style="margin-top:.7rem"><div class="field"><label for="user">MySQL user</label><input id="user" autocomplete="username"></div><div class="field"><label for="password">Password</label><input id="password" type="password" autocomplete="current-password"></div><div class="field"><label for="interval">Sample interval (seconds)</label><input id="interval" type="number" min="0.1" step="0.1" value="1"></div></div><h3>performance_schema tables</h3><div class="toolbar"><button type="button" id="discover">Load tables</button><span class="muted">Uses the first reachable server and the credentials above.</span></div><div id="tablepick" class="tablepick"><span class="muted">Load tables to select what to monitor.</span></div><div class="actions"><button type="button" id="start" class="primary">Start observe</button><button type="button" id="stop">Stop observer</button><span id="run" class="muted">Observer stopped</span></div><p id="message" role="status"></p></section>
 <div class="layout"><aside class="left" id="servers"><section class="panel muted">Server status appears here after Start observe.</section></aside><div class="right"><section class="panel"><h2>Events <small id="eventnote"></small></h2><table class="eventtable"><thead><tr><th>UTC time</th><th>Elapsed</th><th>Server</th><th>Event</th><th>Detail</th></tr></thead><tbody id="events"></tbody></table></section><section class="panel"><h2>Selected table content <small id="limitnote"></small></h2><div id="contents" class="muted">Choose tables and start observing.</div></section></div></div>
+<section class="panel propagation"><h2>LSN propagation <small>First server is primary; delay is measured from sampled LSN values.</small></h2><table><thead><tr><th>Primary observed (UTC)</th><th>Primary LSN</th><th>Primary checkpoint</th><th>Target server</th><th>Target LSN</th><th>Target checkpoint</th><th>Target observed (UTC)</th><th>Delay</th><th>Status</th></tr></thead><tbody id="propagation"><tr><td colspan="9" class="muted">Start observing at least two servers.</td></tr></tbody></table></section>
 </main><script>
 const $=s=>document.querySelector(s),esc=s=>String(s??'—').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function addServer(name='',host='',port=3306){const row=document.createElement('div');row.className='serverinput';row.innerHTML=`<input class="name" placeholder="Display name" aria-label="Display name"><input class="host" placeholder="DB hostname or IP" aria-label="DB hostname or IP"><input class="port" type="number" min="1" max="65535" aria-label="MySQL port"><button type="button" aria-label="Remove server">Remove</button>`;row.querySelector('.name').value=name;row.querySelector('.host').value=host;row.querySelector('.port').value=port;row.querySelector('button').onclick=()=>row.remove();$('#serverInputs').append(row)}
@@ -255,9 +358,10 @@ $('#stop').onclick=async()=>{try{await api('/api/stop',{method:'POST'});message(
 function uptime(n){if(n==null)return '—';const d=Math.floor(n/86400),h=Math.floor(n%86400/3600),m=Math.floor(n%3600/60),s=Math.floor(n%60);return (d?`${d}d `:'')+[h,m,s].map(x=>String(x).padStart(2,'0')).join(':')}
 const serverHues=[210,25,135,275,45,180,320,90,235,10,155,295,60,195,345,115];
 function serverStyle(s){return `style="--server-hue:${serverHues[(Number(s.id.slice(1))-1)%serverHues.length]??210}"`}
-function serverCard(s){return `<section class="server" ${serverStyle(s)}><b>${esc(s.name)}</b><div>${esc(s.host)}:${esc(s.port)}</div><div class="${s.connected?'ok':'error'}">${s.connected?'CONNECTED':'NO CONNECTION'}</div><div>Hostname: ${esc(s.hostname)}</div><div>Uptime: ${uptime(s.uptime_seconds)}</div><div>Read only: ${s.read_only==null?'—':s.read_only?'YES':'NO (RW)'}</div><div>GTID executed: <span style="overflow-wrap:anywhere">${s.gtid_error?`<span class="error">${esc(s.gtid_error)}</span>`:esc(s.gtid_executed||'(empty)')}</span></div><div>Replication: ${esc(s.replication)}</div>${s.error?`<div class="error">${esc(s.error)}</div>`:''}<small>Last sample: ${esc(s.observed_at)}</small></section>`}
+function serverCard(s){return `<section class="server" ${serverStyle(s)}><b>${esc(s.name)}${s.id==='s1'?' (Primary)':''}</b><div>${esc(s.host)}:${esc(s.port)}</div><div class="${s.connected?'ok':'error'}">${s.connected?'CONNECTED':'NO CONNECTION'}</div><div>Hostname: ${esc(s.hostname)}</div><div>Uptime: ${uptime(s.uptime_seconds)}</div><div>Read only: ${s.read_only==null?'—':s.read_only?'YES':'NO (RW)'}</div><div>GTID executed: <span style="overflow-wrap:anywhere">${s.gtid_error?`<span class="error">${esc(s.gtid_error)}</span>`:esc(s.gtid_executed||'(empty)')}</span></div><div>Server UUID: ${esc(s.server_uuid||'—')}</div><div>InnoDB LSN: ${s.log_status_error?`<span class="error">${esc(s.log_status_error)}</span>`:esc(s.innodb_lsn??'—')}</div><div>InnoDB LSN checkpoint: ${esc(s.innodb_lsn_checkpoint??'—')}</div><div>Replication: ${esc(s.replication)}</div>${s.error?`<div class="error">${esc(s.error)}</div>`:''}<small>Last sample: ${esc(s.observed_at)}</small></section>`}
 function tableBlock(s,name,t){let head=t.columns.map(c=>`<th>${esc(c)}</th>`).join('');let body=t.rows.map(row=>`<tr>${row.map(v=>`<td>${esc(v)}</td>`).join('')}</tr>`).join('');return `<div class="tablebox" ${serverStyle(s)}><h3>${esc(s.name)} · ${esc(name)} <small>(${t.rows.length} sampled rows; ${esc(t.observed_at)})</small></h3>${t.error?`<p class="error">${esc(t.error)}</p>`:t.rows.length?`<table class="datagrid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`:'<p class="muted">No rows in sample.</p>'}</div>`}
-async function refresh(){try{const data=await api('/api/status');$('#run').textContent=data.running?'Observer running':'Observer stopped';if(!data.servers.length)return;$('#servers').innerHTML=data.servers.map(serverCard).join('');$('#events').innerHTML=[...data.events].reverse().map(e=>`<tr><td>${esc(e.timestamp_utc)}</td><td>${e.elapsed_seconds.toFixed(3)} s</td><td>${esc(e.server)}</td><td>${esc(e.event)}</td><td>${esc(e.detail)}</td></tr>`).join('');$('#eventnote').textContent=`${data.events.length} recent events` ;$('#limitnote').textContent=`first ${data.row_limit} rows per table`;$('#contents').innerHTML=data.servers.flatMap(s=>data.selected_tables.map(name=>tableBlock(s,name,s.tables[name]||{columns:[],rows:[],error:'Waiting for first sample',observed_at:''}))).join('')||'<span class="muted">No tables selected.</span>'}catch(error){message(error.message,true)}}
+function propagationRow(r){return `<tr><td>${esc(r.primary_seen_at)}</td><td>${esc(r.primary_lsn)}</td><td>${esc(r.primary_checkpoint)}</td><td>${esc(r.target_name)}</td><td>${esc(r.target_lsn)}</td><td>${esc(r.target_checkpoint)}</td><td>${esc(r.target_seen_at)}</td><td>${r.latency_seconds==null?'—':`${Number(r.latency_seconds).toFixed(3)} s`}</td><td>${esc(r.status)}</td></tr>`}
+async function refresh(){try{const data=await api('/api/status');$('#run').textContent=data.running?'Observer running':'Observer stopped';if(!data.servers.length)return;$('#servers').innerHTML=data.servers.map(serverCard).join('');$('#events').innerHTML=[...data.events].reverse().map(e=>`<tr><td>${esc(e.timestamp_utc)}</td><td>${e.elapsed_seconds.toFixed(3)} s</td><td>${esc(e.server)}</td><td>${esc(e.event)}</td><td>${esc(e.detail)}</td></tr>`).join('');$('#eventnote').textContent=`${data.events.length} recent events` ;$('#limitnote').textContent=`first ${data.row_limit} rows per table`;$('#contents').innerHTML=data.servers.flatMap(s=>data.selected_tables.map(name=>tableBlock(s,name,s.tables[name]||{columns:[],rows:[],error:'Waiting for first sample',observed_at:''}))).join('')||'<span class="muted">No tables selected.</span>';$('#propagation').innerHTML=data.propagation_rows.slice(-100).reverse().map(propagationRow).join('')||'<tr><td colspan="9" class="muted">Waiting for the primary LSN to change.</td></tr>'}catch(error){message(error.message,true)}}
 setInterval(refresh,1000);refresh();
 </script></body></html>'''
 
@@ -332,7 +436,8 @@ def status():
     with app_lock:
         current = monitor
     return jsonify(current.snapshot() if current else {"running": False, "servers": [], "events": [],
-                                                     "row_limit": ROW_LIMIT, "selected_tables": []})
+                                                     "row_limit": ROW_LIMIT, "propagation_rows": [],
+                                                     "selected_tables": []})
 
 
 if __name__ == "__main__":
