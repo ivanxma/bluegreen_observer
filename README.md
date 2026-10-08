@@ -1,6 +1,6 @@
 # Bluegreen Observer
 
-Local Flask dashboards for watching MySQL servers during an externally managed blue/green switchover. These dashboards only query MySQL; none initiates or changes a switchover.
+Local Flask dashboards for watching MySQL servers during an externally managed blue/green switchover, plus a separate write stress tool. The observer dashboards only query MySQL; none initiates or changes a switchover.
 
 ## Install
 
@@ -65,8 +65,64 @@ sample interval and query timeouts. Uptime means server uptime; it is unavailabl
 while the cached connection is down. Events, selected table content, and LSN
 propagation are retained below the two status tables.
 
-Run the connection lifecycle and route checks with:
+Run the test suite with:
 
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+## MySQL write stress and secondary lag
+
+Start the web interface after installing the requirements:
+
+```bash
+python3 mysql_write_stress_web.py
+```
+
+Open <http://127.0.0.1:5053>. Enter the primary and secondary IP addresses and ports,
+the shared MySQL user and password, an existing database, thread count, rows per
+commit, payload size, and duration. **Start test** creates one table per worker
+and begins writing. **Stop writes** lets current transactions finish and then
+waits for the secondary to catch up (or for the configured timeout). The final
+result shows committed rows, transactions, rows and payload bytes per commit,
+write rate, final primary LSN arrival latency, and mean and maximum sampled LSN
+arrival latency. The page also offers a CSV download with all lag samples. The
+web server binds to localhost by default; use `--host` and `--port` to change
+its listening address and port.
+
+The workload creates one InnoDB table per worker in the existing database and
+commits each batch as one transaction. Rows have an 8 KiB binary payload by
+default. Existing rows are retained. The account needs `CREATE` and `INSERT`
+on the primary database. The web interface accepts up to 64 threads and limits
+each batch to 64 MiB of payload.
+
+The same workload is available from the CLI:
+
+```bash
+export MYSQL_PASSWORD='your-password'
+python3 mysql_write_stress.py --host 10.0.0.1 --port 3306 \
+  --secondary-host 10.0.0.2 --secondary-port 3306 \
+  --user stress --database loadtest --threads 8 --batch-size 100 \
+  --row-bytes 8192 --duration 60
+```
+
+`--secondary-host` is optional for the CLI and required in the web interface.
+With it, the program reads each target table on
+the secondary and samples both servers' InnoDB LSN from
+`performance_schema.log_status` every second. It writes timestamped LSN values,
+their signed gap, and committed versus visible batch counts to
+`mysql_lag_<run_id>.csv`. Use `--lag-csv` to choose another path,
+`--lag-interval` to change the sample period, and `--catchup-timeout` to set how
+long to wait after writes stop (default 60 seconds). The secondary account needs
+`SELECT` on the target tables and `SELECT` plus `BACKUP_ADMIN` for `log_status`.
+The tool exits nonzero if a worker fails or the secondary does not catch up.
+
+LSN comparisons represent propagation time only when the two servers use
+comparable InnoDB redo LSNs. Ordinary MySQL replicas can have independent LSN
+sequences; in that case use the CSV's visible batch counts as the replication
+signal. LSN arrival latency starts when a primary LSN is sampled and ends when
+the secondary is first sampled at or above it; its precision is limited by
+`--lag-interval`. The displayed commit size counts payload bytes, excluding row
+and index overhead. Keep `--batch-size` × `--row-bytes` below the server's
+`max_allowed_packet`, since the connector may send a batch as one multi-row
+statement. Stop the CLI with Ctrl+C.
