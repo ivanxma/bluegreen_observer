@@ -141,8 +141,14 @@ class MultiMonitor:
         if len(self.events) > EVENT_LIMIT:
             del self.events[:len(self.events) - EVENT_LIMIT]
 
+    def make_sample(self, old: ServerSample) -> ServerSample:
+        return ServerSample(old.id, old.name, old.host, old.port, observed_at=now())
+
+    def sample_extra(self, cur: Any, fresh: ServerSample) -> None:
+        """Extension point for observers that collect additional attributes."""
+
     def query(self, old: ServerSample) -> ServerSample:
-        fresh = ServerSample(old.id, old.name, old.host, old.port, observed_at=now())
+        fresh = self.make_sample(old)
         try:
             con = connect(old.host, old.port, self.config["user"], self.config["password"])
             try:
@@ -181,6 +187,7 @@ class MultiMonitor:
                         fresh.replication = ", ".join(f"{k}: {v}" for k, v in fresh.replication_channels.items()) or "No replication channels"
                     except Exception:
                         fresh.replication = "Not available (version or privileges)"
+                    self.sample_extra(cur, fresh)
                     for table in self.config["tables"]:
                         sample = TableSample(observed_at=now())
                         try:

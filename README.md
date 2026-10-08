@@ -1,6 +1,6 @@
 # Bluegreen Observer
 
-Local Flask dashboards for watching MySQL servers during an externally managed blue/green switchover. Both dashboards only query MySQL; neither initiates or changes a switchover.
+Local Flask dashboards for watching MySQL servers during an externally managed blue/green switchover. These dashboards only query MySQL; none initiates or changes a switchover.
 
 ## Install
 
@@ -33,3 +33,40 @@ The left panel shows each server's connection state, hostname, read-only state, 
 Reading `performance_schema.log_status` requires `SELECT` and `BACKUP_ADMIN`. Each read briefly pauses logging while MySQL collects a consistent snapshot, so choose the sample interval with that overhead in mind.
 
 The **LSN propagation** table treats the first configured server as primary. When its sampled InnoDB LSN increases, the table adds a row for each other server and measures the time until that server's sampled LSN reaches or exceeds the primary value. It shows both servers' LSN and `LSN_checkpoint` values. This measurement assumes the servers share comparable redo LSNs, as in this deployment; its precision is limited by the sample interval.
+
+
+## ElasticDBCluster Observer
+
+Run `python elasticdb_cluster_observer.py` and open <http://127.0.0.1:5052>.
+Add 1–16 distinct servers and shared MySQL credentials. Selected
+`performance_schema` tables are optional (up to eight). Use `--port` to change
+the dashboard port.
+
+The first table has one row per attribute and one column per server. Each sample
+opens a new connection to each server and closes it after reading status and
+selected table content. It includes the multi-server observer's attributes plus
+all values returned by `SHOW GLOBAL STATUS LIKE '%airglow%'` and
+`SHOW GLOBAL VARIABLES LIKE '%airglow%'`. Matching names across servers are
+combined into rows labelled **Status** or **Variable**. Query errors and missing
+attributes appear in the relevant server column.
+
+Directly below, the cached connection table shows only uptime, connection status,
+last outage time, outage duration, last restoration time, and the outage event.
+It retains one connection per server across samples and checks it with `SELECT 1`
+before reading uptime. On failure it closes the connection and retries on each
+following sample until successful. Stopping closes all cached connections; wait
+for shutdown to finish before starting again.
+
+Outages start at the first failed check (including an initial connection failure)
+and end at the first successful reconnection. Times use UTC; durations use a
+monotonic clock. An ongoing duration is updated at each check, and the most recent
+outage remains visible after recovery. Detection precision is limited by the
+sample interval and query timeouts. Uptime means server uptime; it is unavailable
+while the cached connection is down. Events, selected table content, and LSN
+propagation are retained below the two status tables.
+
+Run the connection lifecycle and route checks with:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
