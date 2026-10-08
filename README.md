@@ -83,12 +83,13 @@ Open <http://127.0.0.1:5053>. Enter the primary and secondary IP addresses and p
 the shared MySQL user and password, an existing database, thread count, rows per
 commit, payload size, and duration. **Start test** creates one table per worker
 and begins writing. **Stop writes** lets current transactions finish and then
-waits for the secondary to catch up (or for the configured timeout). The final
-result shows committed rows, transactions, rows and payload bytes per commit,
-write rate, final primary LSN arrival latency, and mean and maximum sampled LSN
-arrival latency. The page also offers a CSV download with all lag samples. The
-web server binds to localhost by default; use `--host` and `--port` to change
-its listening address and port.
+waits for the secondary to catch up (or for the configured timeout). The live
+status and final result use tables with groups for workload, secondary catch-up,
+raw LSN timing, normalization by rows, and normalization by payload size. The
+result includes median and final values for both normalized latency and observed
+catch-up rate. The page offers a CSV download with all lag samples. The web
+server binds to localhost by default; use `--host` and `--port` to change its
+listening address and port.
 
 The workload creates one InnoDB table per worker in the existing database and
 commits each batch as one transaction. Rows have an 8 KiB binary payload by
@@ -122,7 +123,17 @@ comparable InnoDB redo LSNs. Ordinary MySQL replicas can have independent LSN
 sequences; in that case use the CSV's visible batch counts as the replication
 signal. LSN arrival latency starts when a primary LSN is sampled and ends when
 the secondary is first sampled at or above it; its precision is limited by
-`--lag-interval`. The displayed commit size counts payload bytes, excluding row
-and index overhead. Keep `--batch-size` × `--row-bytes` below the server's
+`--lag-interval`. For each primary LSN milestone, the program counts test rows
+committed but not yet visible on the secondary at that sample. It divides the
+milestone's arrival time by those pending rows (reported as ms/1,000 rows) and
+by their payload size (reported as ms/MiB). It also reports the inverse rates in
+rows/s and MiB/s. The final result shows medians across matched milestones and
+the final LSN's values. Samples with no pending test rows or no positive LSN gap
+have no row or payload normalized value. These measures make different batch
+sizes easier to compare, but queueing, concurrent writes, and the sample
+interval still affect them. The
+CSV also includes normalization by the sampled redo LSN gap. The displayed
+commit size counts payload bytes, excluding row and index overhead. Keep
+`--batch-size` × `--row-bytes` below the server's
 `max_allowed_packet`, since the connector may send a batch as one multi-row
 statement. Stop the CLI with Ctrl+C.

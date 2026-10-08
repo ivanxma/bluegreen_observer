@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import re
+import statistics
 import sys
 import threading
 import time
@@ -18,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+MIB = 1024 * 1024
 
 
 @dataclass
@@ -199,6 +201,30 @@ def visible_batches(connection, names: list[str], run_id: bytes) -> dict[str, in
         cursor.close()
 
 
+def normalized_lsn_ms_per_mib(latency_seconds: float, initial_gap_bytes: int) -> float | None:
+    """Time to reach a sampled LSN per MiB of initial comparable redo gap."""
+    if initial_gap_bytes <= 0:
+        return None
+    return round(latency_seconds * 1000 * MIB / initial_gap_bytes, 3)
+
+
+def normalized_workload(latency_seconds: float, pending_rows: int,
+                        row_bytes: int) -> dict[str, float | None]:
+    """Normalize an LSN arrival by test rows pending at the initial sample."""
+    if pending_rows <= 0:
+        return {"ms_per_1000_rows": None, "ms_per_mib_payload": None,
+                "rows_per_second": None, "payload_mib_per_second": None}
+    payload_mib = pending_rows * row_bytes / MIB
+    return {
+        "ms_per_1000_rows": round(latency_seconds * 1_000_000 / pending_rows, 3),
+        "ms_per_mib_payload": round(latency_seconds * 1000 / payload_mib, 3),
+        "rows_per_second": round(pending_rows / latency_seconds, 3)
+        if latency_seconds > 0 else None,
+        "payload_mib_per_second": round(payload_mib / latency_seconds, 3)
+        if latency_seconds > 0 else None,
+    }
+
+
 def monitor_lag(args: argparse.Namespace, names: list[str], run_id: bytes,
                 start: threading.Event, ready: threading.Event, stop: threading.Event,
                 writes_done: threading.Event, committed: dict[str, int],
@@ -206,7 +232,11 @@ def monitor_lag(args: argparse.Namespace, names: list[str], run_id: bytes,
                 on_sample: Callable[[dict], None] | None = None) -> dict:
     """Sample LSNs and actual row visibility until both catch up or timeout."""
     outcome = {"error": "", "caught_up": False, "samples": 0, "max_lsn_gap": 0,
-               "lsn_lag_seconds": [], "final_lsn_arrival_seconds": None,
+               "lsn_lag_seconds": [], "normalized_lsn_ms_per_mib": [],
+               "workload_ms_per_1000_rows": [], "workload_ms_per_mib_payload": [],
+               "workload_rows_per_second": [], "workload_mib_per_second": [],
+               "final_lsn_arrival_seconds": None, "final_lsn_ms_per_mib": None,
+               "final_workload": None,
                "final_lsn": None, "final_outstanding_batches": None,
                "csv_path": csv_path}
     primary = secondary = None
@@ -220,14 +250,20 @@ def monitor_lag(args: argparse.Namespace, names: list[str], run_id: bytes,
             writer = csv.writer(output)
             writer.writerow(["observed_utc", "primary_lsn", "secondary_lsn", "lsn_gap",
                              "committed_batches", "visible_batches", "outstanding_batches",
-                             "oldest_pending_lsn_seconds", "newly_matched_lsn_seconds"])
+                             "oldest_pending_lsn_seconds", "newly_matched_lsn_seconds",
+                             "newly_matched_initial_gap_bytes", "newly_matched_ms_per_mib_redo",
+                             "newly_matched_pending_rows", "newly_matched_ms_per_1000_rows",
+                             "newly_matched_ms_per_mib_payload", "newly_matched_rows_per_second",
+                             "newly_matched_payload_mib_per_second"])
             ready.set()
             start.wait()
-            pending: list[tuple[int, float]] = []
+            pending: list[tuple[int, float, int, int]] = []
             last_primary_lsn = None
             finish_deadline = None
             final_lsn = None
             final_lsn_seen_at = None
+            final_lsn_gap = None
+            final_pending_rows = None
             while not stop.is_set():
                 sampled_at = time.monotonic()
                 primary_lsn = read_lsn(primary)
@@ -235,22 +271,48 @@ def monitor_lag(args: argparse.Namespace, names: list[str], run_id: bytes,
                 visible = visible_batches(secondary, names, run_id)
                 with committed_lock:
                     target = dict(committed)
-                if last_primary_lsn is not None and primary_lsn > last_primary_lsn:
-                    pending.append((primary_lsn, sampled_at))
+                outstanding = sum(max(0, target[name] - visible[name]) for name in names)
+                pending_rows = outstanding * args.batch_size
+                if (last_primary_lsn is not None and primary_lsn > last_primary_lsn
+                        and primary_lsn > secondary_lsn):
+                    pending.append((primary_lsn, sampled_at,
+                                    max(0, primary_lsn - secondary_lsn), pending_rows))
                 last_primary_lsn = primary_lsn
-                matched = [round(max(0.0, sampled_at - since), 3)
-                           for lsn, since in pending if secondary_lsn >= lsn]
-                pending = [(lsn, since) for lsn, since in pending if secondary_lsn < lsn]
-                outcome["lsn_lag_seconds"].extend(matched)
+                matched = [(max(0.0, sampled_at - since), initial_gap, rows)
+                           for lsn, since, initial_gap, rows in pending if secondary_lsn >= lsn]
+                pending = [(lsn, since, initial_gap, rows)
+                           for lsn, since, initial_gap, rows in pending
+                           if secondary_lsn < lsn]
+                outcome["lsn_lag_seconds"].extend(round(seconds, 3) for seconds, _, _ in matched)
+                outcome["normalized_lsn_ms_per_mib"].extend(
+                    value for seconds, initial_gap, _ in matched
+                    if (value := normalized_lsn_ms_per_mib(seconds, initial_gap)) is not None)
+                for seconds, _, rows in matched:
+                    metrics = normalized_workload(seconds, rows, args.row_bytes)
+                    for metric, key in (("ms_per_1000_rows", "workload_ms_per_1000_rows"),
+                                        ("ms_per_mib_payload", "workload_ms_per_mib_payload"),
+                                        ("rows_per_second", "workload_rows_per_second"),
+                                        ("payload_mib_per_second", "workload_mib_per_second")):
+                        if metrics[metric] is not None:
+                            outcome[key].append(metrics[metric])
+                slowest = max(matched, default=None)
+                slowest_workload = (normalized_workload(slowest[0], slowest[2], args.row_bytes)
+                                    if slowest else None)
                 gap = primary_lsn - secondary_lsn
                 outcome["max_lsn_gap"] = max(outcome["max_lsn_gap"], max(0, gap))
-                outstanding = sum(max(0, target[name] - visible[name]) for name in names)
                 outcome["final_outstanding_batches"] = outstanding
                 oldest = round(sampled_at - pending[0][1], 3) if pending else ""
                 writer.writerow([datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
                                  primary_lsn, secondary_lsn, gap, sum(target.values()),
                                  sum(visible.values()), outstanding, oldest,
-                                 max(matched) if matched else ""])
+                                 round(slowest[0], 3) if slowest else "",
+                                 slowest[1] if slowest else "",
+                                 normalized_lsn_ms_per_mib(slowest[0], slowest[1]) if slowest else "",
+                                 slowest[2] if slowest else "",
+                                 slowest_workload["ms_per_1000_rows"] if slowest else "",
+                                 slowest_workload["ms_per_mib_payload"] if slowest else "",
+                                 slowest_workload["rows_per_second"] if slowest else "",
+                                 slowest_workload["payload_mib_per_second"] if slowest else ""])
                 output.flush()
                 outcome["samples"] += 1
                 if on_sample:
@@ -259,17 +321,30 @@ def monitor_lag(args: argparse.Namespace, names: list[str], run_id: bytes,
                                "visible_batches": sum(visible.values()),
                                "outstanding_batches": outstanding,
                                "oldest_pending_lsn_seconds": oldest,
-                               "newly_matched_lsn_seconds": max(matched) if matched else None,
+                               "newly_matched_lsn_seconds": round(slowest[0], 3) if slowest else None,
+                               "newly_matched_ms_per_mib": normalized_lsn_ms_per_mib(slowest[0], slowest[1])
+                               if slowest else None,
+                               "newly_matched_ms_per_1000_rows": slowest_workload["ms_per_1000_rows"]
+                               if slowest else None,
+                               "newly_matched_ms_per_mib_payload": slowest_workload["ms_per_mib_payload"]
+                               if slowest else None,
                                "samples": outcome["samples"]})
                 if writes_done.is_set():
                     if finish_deadline is None:
                         finish_deadline = sampled_at + args.catchup_timeout
                         final_lsn = primary_lsn
                         final_lsn_seen_at = sampled_at
+                        final_lsn_gap = max(0, primary_lsn - secondary_lsn)
+                        final_pending_rows = pending_rows
                         outcome["final_lsn"] = final_lsn
                     if secondary_lsn >= final_lsn and outcome["final_lsn_arrival_seconds"] is None:
-                        outcome["final_lsn_arrival_seconds"] = round(
-                            max(0, sampled_at - final_lsn_seen_at), 3)
+                        final_latency = max(0, sampled_at - final_lsn_seen_at)
+                        outcome["final_lsn_arrival_seconds"] = round(final_latency, 3)
+                        outcome["final_lsn_ms_per_mib"] = normalized_lsn_ms_per_mib(
+                            final_latency, final_lsn_gap)
+                        outcome["final_workload"] = (normalized_workload(
+                            final_latency, final_pending_rows, args.row_bytes)
+                            if final_lsn_gap > 0 else None)
                     if secondary_lsn >= final_lsn and outstanding == 0:
                         outcome["caught_up"] = True
                         break
@@ -354,6 +429,11 @@ def execute(args: argparse.Namespace, stop_request: threading.Event | None = Non
     total_batches = sum(item.batches for item in results)
     total_rows = sum(item.rows for item in results)
     lags = lag_outcome["lsn_lag_seconds"] if lag_outcome else []
+    normalized = lag_outcome["normalized_lsn_ms_per_mib"] if lag_outcome else []
+
+    def median(values: list[float]) -> float | None:
+        return round(statistics.median(values), 3) if values else None
+
     failed = any(item.error for item in results) or bool(
         lag_outcome and (lag_outcome["error"] or not lag_outcome["caught_up"]))
     return {
@@ -375,8 +455,22 @@ def execute(args: argparse.Namespace, stop_request: threading.Event | None = Non
             "lsn_arrivals": len(lags),
             "mean_lsn_arrival_seconds": round(sum(lags) / len(lags), 3) if lags else None,
             "max_lsn_arrival_seconds": max(lags) if lags else None,
+            "median_normalized_lsn_ms_per_mib": median(normalized),
+            "median_ms_per_1000_rows": median(lag_outcome["workload_ms_per_1000_rows"]),
+            "median_ms_per_mib_payload": median(lag_outcome["workload_ms_per_mib_payload"]),
+            "median_rows_per_second": median(lag_outcome["workload_rows_per_second"]),
+            "median_payload_mib_per_second": median(lag_outcome["workload_mib_per_second"]),
             "final_primary_lsn": lag_outcome["final_lsn"],
             "final_lsn_arrival_seconds": lag_outcome["final_lsn_arrival_seconds"],
+            "final_lsn_ms_per_mib": lag_outcome["final_lsn_ms_per_mib"],
+            "final_ms_per_1000_rows": lag_outcome["final_workload"]["ms_per_1000_rows"]
+            if lag_outcome["final_workload"] else None,
+            "final_ms_per_mib_payload": lag_outcome["final_workload"]["ms_per_mib_payload"]
+            if lag_outcome["final_workload"] else None,
+            "final_rows_per_second": lag_outcome["final_workload"]["rows_per_second"]
+            if lag_outcome["final_workload"] else None,
+            "final_payload_mib_per_second": lag_outcome["final_workload"]["payload_mib_per_second"]
+            if lag_outcome["final_workload"] else None,
             "final_outstanding_batches": lag_outcome["final_outstanding_batches"],
             "lag_csv": lag_outcome["csv_path"],
             "error": lag_outcome["error"],
@@ -398,7 +492,10 @@ def run(args: argparse.Namespace) -> int:
         print(f"Secondary: {'caught up' if secondary['caught_up'] else 'did not catch up'}; "
               f"{secondary['samples']} samples; max sampled LSN gap "
               f"{secondary['max_sampled_lsn_gap']}; max observed LSN arrival "
-              f"{secondary['max_lsn_arrival_seconds']}s; lag CSV: {secondary['lag_csv']}")
+              f"{secondary['max_lsn_arrival_seconds']}s; median normalized catch-up "
+              f"{secondary['median_ms_per_1000_rows']} ms/1000 rows, "
+              f"{secondary['median_ms_per_mib_payload']} ms/MiB payload; "
+              f"lag CSV: {secondary['lag_csv']}")
         if secondary["error"]:
             print(f"Lag monitor ERROR: {secondary['error']}", file=sys.stderr)
     return 1 if result["state"] == "failed" else 0

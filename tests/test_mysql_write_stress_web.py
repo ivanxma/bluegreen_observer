@@ -24,6 +24,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(page.status_code, 200)
         self.assertIn(b"Secondary IP or host", page.data)
         self.assertIn(b"Stop writes", page.data)
+        self.assertIn(b"Normalized by pending rows", page.data)
+        self.assertIn(b"Normalized by pending payload", page.data)
         self.assertEqual(self.client.post("/api/start", json={"password": "secret"}).status_code, 400)
         config = web.config_from_json(valid_config())
         self.assertEqual((config.threads, config.batch_size, config.row_bytes), (2, 10, 8192))

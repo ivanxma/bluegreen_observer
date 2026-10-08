@@ -107,6 +107,42 @@ class StressTests(unittest.TestCase):
         self.assertEqual(outcome["max_lsn_gap"], 10)
         self.assertTrue(primary.closed and secondary.closed)
 
+    def test_row_and_payload_normalization(self):
+        metrics = stress.normalized_workload(2.0, 1000, 1024)
+        self.assertEqual(metrics["ms_per_1000_rows"], 2000)
+        self.assertEqual(metrics["ms_per_mib_payload"], 2048)
+        self.assertEqual(metrics["rows_per_second"], 500)
+        self.assertEqual(metrics["payload_mib_per_second"], 0.488)
+        self.assertIsNone(stress.normalized_workload(2.0, 0, 1024)["ms_per_1000_rows"])
+
+    def test_lsn_milestone_records_row_and_payload_rates(self):
+        primary, secondary = FakeConnection(), FakeConnection()
+        start, ready, stop, done = (threading.Event() for _ in range(4))
+        start.set()
+
+        def after_sample(sample):
+            if sample["samples"] == 2:
+                done.set()
+
+        target_lsn = 100 + 1024 * 1024
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(stress, "connect", side_effect=[primary, secondary]), \
+             patch.object(stress, "read_lsn", side_effect=[100, 90, target_lsn, 100,
+                                                            target_lsn, target_lsn]), \
+             patch.object(stress, "visible_batches", side_effect=[{"t": 0}, {"t": 0}, {"t": 1}]):
+            csv_path = str(Path(directory) / "lag.csv")
+            outcome = stress.monitor_lag(self.args("--secondary-host", "secondary",
+                                                   "--lag-interval", "0.001"),
+                                         ["t"], b"a" * 16, start, ready, stop, done,
+                                         {"t": 1}, threading.Lock(), csv_path, after_sample)
+            csv_text = Path(csv_path).read_text()
+        self.assertTrue(outcome["caught_up"])
+        self.assertEqual(len(outcome["workload_ms_per_1000_rows"]), 1)
+        self.assertEqual(len(outcome["workload_ms_per_mib_payload"]), 1)
+        self.assertIsNotNone(outcome["final_workload"]["rows_per_second"])
+        self.assertIn("newly_matched_ms_per_1000_rows", csv_text)
+        self.assertIn("newly_matched_ms_per_mib_payload", csv_text)
+
     def test_invalid_identifiers_rejected(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             self.args("--table-prefix", "bad`name")

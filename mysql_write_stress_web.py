@@ -193,10 +193,10 @@ button.stop{background:#ba4137}button:disabled{background:#9aaabc;cursor:default
 .status{display:inline-block;padding:5px 10px;border-radius:20px;background:#e7edf5;font-weight:650;text-transform:capitalize}
 .status.running{background:#d6f4e5;color:#176342}.status.catching_up{background:#fff0c8;color:#784f00}
 .status.failed{background:#ffe0dd;color:#9f2e25}.status.completed{background:#d6f4e5;color:#176342}
-.metrics{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:18px 0}.metric{background:#f3f7fb;border-radius:8px;padding:12px}
-.metric strong{display:block;font-size:1.5rem;margin-top:3px}.muted{color:#63768c;font-size:.86rem}.error{color:#a7251d;font-weight:600;white-space:pre-wrap}
+.muted{color:#63768c;font-size:.86rem}.error{color:#a7251d;font-weight:600;white-space:pre-wrap}
 table{width:100%;border-collapse:collapse;font-size:.88rem;margin-top:10px}th,td{text-align:left;padding:8px;border-bottom:1px solid #e2e8f0}
-.wide{margin-top:18px}.hidden{display:none}a{color:#1766c2}#summary{line-height:1.65}
+th{color:#425672;background:#f3f7fb}.group-row th{background:#e8f0fa;color:#244a75;padding-top:11px}
+.wide{margin-top:18px}.hidden{display:none}a{color:#1766c2}
 </style></head><body>
 <h1>MySQL write stress</h1><p class="sub">Create one InnoDB table per worker, commit batches, and observe secondary LSN and row visibility.</p>
 <div class="grid"><section class="panel"><h2>Connection and workload</h2>
@@ -217,40 +217,38 @@ table{width:100%;border-collapse:collapse;font-size:.88rem;margin-top:10px}th,td
 </div><div class="actions"><button id="start" type="submit">Start test</button><button id="stop" class="stop" type="button" disabled>Stop writes</button></div>
 <p class="muted">Stop finishes the current transactions, then waits for the secondary to catch up or reach the timeout.</p><div id="form-error" class="error"></div></form></section>
 <section class="panel"><h2>Run status</h2><span id="state" class="status">Idle</span><p id="run-id" class="muted"></p>
-<div class="metrics"><div class="metric">Committed rows<strong id="rows">0</strong></div><div class="metric">Transactions<strong id="transactions">0</strong></div>
-<div class="metric">Payload committed<strong id="payload">0 MiB</strong></div><div class="metric">Outstanding batches<strong id="outstanding">—</strong></div></div>
-<div id="live" class="muted">Waiting for a run.</div><div id="run-error" class="error"></div>
+<table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody id="live-rows"></tbody></table><div id="run-error" class="error"></div>
 <a id="download" class="hidden" href="/api/lag.csv">Download lag samples (CSV)</a></section></div>
 <section class="panel wide"><h2>Final result</h2><div id="summary" class="muted">Results appear after the test stops and catch-up monitoring finishes.</div>
-<div id="table-wrap" class="hidden"><table><thead><tr><th>Table</th><th>Commits</th><th>Rows</th><th>Error</th></tr></thead><tbody id="table-rows"></tbody></table></div>
-<p class="muted">LSN latency is measured between samples and assumes comparable redo LSNs on both servers. Payload size excludes row and index overhead.</p></section>
+<div id="table-wrap" class="hidden"><table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody id="result-rows"></tbody></table>
+<h2 style="margin-top:22px">Per-table writes</h2><table><thead><tr><th>Table</th><th>Commits</th><th>Rows</th><th>Error</th></tr></thead><tbody id="table-rows"></tbody></table></div>
+<p class="muted">Row and payload rates use the batches still absent on the secondary when each primary LSN was sampled. Zero-backlog samples have no normalized value. Redo LSN comparisons require comparable LSNs on both servers; sampling limits precision. Payload size excludes row and index overhead.</p></section>
 <script>
 const $=id=>document.getElementById(id);const num=n=>Number(n||0).toLocaleString();
 const bytes=n=>`${(Number(n||0)/1048576).toFixed(2)} MiB`;
 const sec=n=>n==null?'—':`${Number(n).toFixed(3)} s`;
+const fixed=(n,unit)=>n==null?'—':`${Number(n).toFixed(3)} ${unit}`;
 async function api(path,options){const response=await fetch(path,options);const data=await response.json();if(!response.ok)throw Error(data.error||`HTTP ${response.status}`);return data}
-function line(parent,label,value){const div=document.createElement('div');const b=document.createElement('strong');b.textContent=label+': ';div.append(b,document.createTextNode(value));parent.append(div)}
+function group(parent,title,entries){const heading=document.createElement('tr');heading.className='group-row';const header=document.createElement('th');header.colSpan=2;header.textContent=title;heading.append(header);parent.append(heading);
+  for(const [label,value] of entries){const tr=document.createElement('tr');const th=document.createElement('th');th.scope='row';th.textContent=label;const td=document.createElement('td');td.textContent=value;tr.append(th,td);parent.append(tr)}}
 function render(s){const active=['starting','running','catching_up','finishing'].includes(s.state);
   $('state').textContent=s.stop_requested&&s.state==='running'?'Stopping writes':s.state.replaceAll('_',' ');$('state').className='status '+s.state;
   $('start').disabled=active;$('stop').disabled=!active||s.stop_requested||s.state==='catching_up'||s.state==='finishing';
-  $('run-id').textContent=s.run_id?`Run ID: ${s.run_id}`:'';$('rows').textContent=num(s.rows);$('transactions').textContent=num(s.transactions);
-  $('payload').textContent=bytes(s.payload_bytes);$('outstanding').textContent=s.sample?num(s.sample.outstanding_batches):'—';
-  $('live').textContent=s.sample?`Primary LSN ${num(s.sample.primary_lsn)} · Secondary LSN ${num(s.sample.secondary_lsn)} · Gap ${num(s.sample.lsn_gap)} · Visible batches ${num(s.sample.visible_batches)} / ${num(s.sample.committed_batches)} · Samples ${num(s.sample.samples)}`:'Waiting for the first lag sample.';
+  $('run-id').textContent=s.run_id?`Run ID: ${s.run_id}`:'';
+  const live=$('live-rows');live.replaceChildren();group(live,'Write totals',[["Committed rows",num(s.rows)],["Transactions",num(s.transactions)],["Payload committed",bytes(s.payload_bytes)]]);
+  if(s.sample){group(live,'Secondary sample',[["Primary LSN",num(s.sample.primary_lsn)],["Secondary LSN",num(s.sample.secondary_lsn)],["LSN gap",num(s.sample.lsn_gap)],["Visible / committed batches",`${num(s.sample.visible_batches)} / ${num(s.sample.committed_batches)}`],["Outstanding batches",num(s.sample.outstanding_batches)],["Samples",num(s.sample.samples)]]);
+    group(live,'Latest normalized arrival',[["By rows",fixed(s.sample.newly_matched_ms_per_1000_rows,'ms/1,000 rows')],["By payload",fixed(s.sample.newly_matched_ms_per_mib_payload,'ms/MiB')]])}
   $('run-error').textContent=s.error||'';$('download').classList.toggle('hidden',!s.lag_csv);
-  const out=$('summary');out.replaceChildren();$('table-rows').replaceChildren();$('table-wrap').classList.toggle('hidden',!s.summary);
+  const out=$('summary');const results=$('result-rows');results.replaceChildren();$('table-rows').replaceChildren();$('table-wrap').classList.toggle('hidden',!s.summary);
   if(!s.summary){out.textContent='Results appear after the test stops and catch-up monitoring finishes.';return}
-  const r=s.summary;out.className='';line(out,'Stopped by',r.stop_reason==='manual'?'Manual stop':'Duration');
-  line(out,'Committed rows',num(r.rows));line(out,'Transactions',num(r.transactions));
-  line(out,'Commit size',`${num(r.rows_per_commit)} rows / ${bytes(r.payload_bytes_per_commit)} payload`);
-  line(out,'Write duration',sec(r.write_seconds));line(out,'Write rate',`${num(r.rows_per_second)} rows/s`);
-  if(r.secondary){line(out,'Secondary catch-up',r.secondary.caught_up?'Observed':'Not observed before timeout');
-    line(out,'Outstanding batches at end',r.secondary.final_outstanding_batches==null?'—':num(r.secondary.final_outstanding_batches));
-    line(out,'LSN arrivals measured',num(r.secondary.lsn_arrivals));
-    line(out,'Mean LSN arrival latency',sec(r.secondary.mean_lsn_arrival_seconds));
-    line(out,'Max LSN arrival latency',sec(r.secondary.max_lsn_arrival_seconds));
-    line(out,'Final primary LSN arrival latency',sec(r.secondary.final_lsn_arrival_seconds));
-    line(out,'Maximum sampled LSN gap',num(r.secondary.max_sampled_lsn_gap));
-    if(r.secondary.error)line(out,'Monitor error',r.secondary.error)}
+  const r=s.summary;out.textContent='';
+  group(results,'Workload',[["Stopped by",r.stop_reason==='manual'?'Manual stop':'Duration'],["Committed rows",num(r.rows)],["Transactions",num(r.transactions)],["Rows per commit",num(r.rows_per_commit)],["Payload per commit",bytes(r.payload_bytes_per_commit)],["Write duration",sec(r.write_seconds)],["Write rate",fixed(r.rows_per_second,'rows/s')]]);
+  if(r.secondary){const v=r.secondary;
+    group(results,'Secondary catch-up',[["Result",v.caught_up?'Observed':'Not observed before timeout'],["Outstanding batches at end",v.final_outstanding_batches==null?'—':num(v.final_outstanding_batches)],["LSN arrivals measured",num(v.lsn_arrivals)],["Maximum sampled LSN gap",num(v.max_sampled_lsn_gap)]]);
+    group(results,'Raw LSN timing',[["Mean arrival",sec(v.mean_lsn_arrival_seconds)],["Maximum arrival",sec(v.max_lsn_arrival_seconds)],["Final primary LSN arrival",sec(v.final_lsn_arrival_seconds)]]);
+    group(results,'Normalized by pending rows',[["Median catch-up",fixed(v.median_ms_per_1000_rows,'ms/1,000 rows')],["Final catch-up",fixed(v.final_ms_per_1000_rows,'ms/1,000 rows')],["Median observed rate",fixed(v.median_rows_per_second,'rows/s')],["Final observed rate",fixed(v.final_rows_per_second,'rows/s')]]);
+    group(results,'Normalized by pending payload',[["Median catch-up",fixed(v.median_ms_per_mib_payload,'ms/MiB')],["Final catch-up",fixed(v.final_ms_per_mib_payload,'ms/MiB')],["Median observed rate",fixed(v.median_payload_mib_per_second,'MiB/s')],["Final observed rate",fixed(v.final_payload_mib_per_second,'MiB/s')]]);
+    if(v.error)group(results,'Monitor error',[["Error",v.error]])}
   for(const t of r.tables){const tr=document.createElement('tr');for(const value of [t.table,num(t.batches),num(t.rows),t.error||'—']){const td=document.createElement('td');td.textContent=value;tr.append(td)}$('table-rows').append(tr)}
 }
 async function refresh(){try{render(await api('/api/status'))}catch(error){$('run-error').textContent=error.message}}
