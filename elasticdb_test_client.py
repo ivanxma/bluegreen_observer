@@ -9,10 +9,11 @@ import time
 import uuid
 
 from mysql_multi_observer import IDENTIFIER, now
+from elasticdb_cluster_roles import discover_roles, role_targets, require_role
 
 
 def config_from_json(data: dict, kind: str) -> dict:
-    if kind not in ('primary', 'readonly'):
+    if kind not in ('primary', 'readonly', 'ddl'):
         raise ValueError('Unknown test case.')
     config = {key: str(data.get(key) or '').strip() for key in ('host', 'user', 'database')}
     config['password'] = str(data.get('password') or '')
@@ -24,8 +25,45 @@ def config_from_json(data: dict, kind: str) -> dict:
         raise ValueError('Use 1–64 threads and a sleep timer of 0.1–3600 seconds.')
     if not math.isfinite(config['pause']) or not .01 <= config['pause'] <= 60:
         raise ValueError('Use a loop pause of 0.01–60 seconds.')
-    if kind == 'primary' and not IDENTIFIER.fullmatch(config['database']):
+    if kind in ('primary', 'ddl') and not IDENTIFIER.fullmatch(config['database']):
         raise ValueError('Enter an existing test database (letters, digits and underscores).')
+    if kind == 'primary':
+        config['batch_size'] = int(data.get('batch_size', 100))
+        columns = data.get('columns', [{'name': 'column_1', 'length': 100}])
+        if not isinstance(columns, list) or not 1 <= len(columns) <= 64:
+            raise ValueError('Specify 1–64 VARCHAR columns.')
+        clean, names = [], {'id', 'createdby'}
+        for column in columns:
+            if not isinstance(column, dict):
+                raise ValueError('Each column needs a name and VARCHAR length.')
+            name = str(column.get('name', '')).strip()
+            length = int(column.get('length', 0))
+            if not IDENTIFIER.fullmatch(name) or len(name) > 64 or name.lower() in names:
+                raise ValueError('Use unique column names of 1–64 letters, digits or underscores; id and createdby are reserved.')
+            if not 1 <= length <= 10000:
+                raise ValueError('VARCHAR lengths must be 1–10000 characters.')
+            names.add(name.lower())
+            clean.append(dict(name=name, length=length))
+        row_chars = sum(c['length'] for c in clean)
+        if row_chars * 4 + len(clean) * 2 + 1100 > 60000:
+            raise ValueError('Combined VARCHAR lengths are too large for an utf8mb4 row (60000-byte budget).')
+        batch_bytes = config['batch_size'] * (row_chars + 300 + len(clean) * 4)
+        if not 1 <= config['batch_size'] <= 10000 or batch_bytes > 16 * 1024 * 1024:
+            raise ValueError('Use 1–10000 rows per batch and at most 16 MiB of estimated batch data.')
+        if batch_bytes * config['threads'] > 64 * 1024 * 1024:
+            raise ValueError('Reduce batch size, column lengths or threads to keep combined batch data within 64 MiB.')
+        config['columns'] = clean
+    if kind == 'ddl':
+        config.update(batch_size=int(data.get('batch_size', 100)),
+                      batches=int(data.get('batches', 2)), width=int(data.get('width', 100)),
+                      consistency_timeout=float(data.get('consistency_timeout', 30)))
+        if not 1 <= config['batch_size'] <= 10000 or not 1 <= config['batches'] <= 100:
+            raise ValueError('Use 1–10000 rows per batch and 1–100 batches per DDL cycle.')
+        if not 1 <= config['width'] <= 10000 or not .1 <= config['consistency_timeout'] <= 300:
+            raise ValueError('Use a VARCHAR width of 1–10000 and consistency timeout of 0.1–300 seconds.')
+        batch_bytes = config['batch_size'] * (config['width'] + 400)
+        if batch_bytes > 16 * 1024 * 1024 or batch_bytes * config['threads'] > 64 * 1024 * 1024:
+            raise ValueError('Reduce DDL batch size, width or threads: limits are 16 MiB per batch and 64 MiB combined.')
     return config
 
 
@@ -47,17 +85,50 @@ class TestRun:
         self.events: deque = deque(maxlen=500)
         self.sessions: dict[str, dict] = {}
         self.active: dict[str, tuple[int, str]] = {}
+        self.active_targets = {}
+        self.roles = config.get('roles', [])
+        self.roles_lock = threading.Lock()
+        self.roles_sampled = 0.0
         self.started_at = now()
+        self.started_clock = time.monotonic()
         self.stopped_at = ''
         self.stopped_clock: float | None = None
         self.cancel_error = ''
         self.outages: dict[str, float] = {}
-        self.table = f"`{config['database']}`.`elastic_observer_test`" if kind == 'primary' else ''
+        self.table = f"`{config['database']}`.`elastic_insert_{self.run_id[:12]}`" if kind == 'primary' else ''
+        self.create_sql = ''
+        self.insert_sql = ''
+        if kind == 'primary':
+            definitions = ', '.join(f"`{c['name']}` VARCHAR({c['length']}) NOT NULL" for c in config['columns'])
+            self.create_sql = (f'CREATE TABLE IF NOT EXISTS {self.table} ('
+                f'`id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY, '
+                f'`createdby` VARCHAR(255) NOT NULL, {definitions}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+            names = ', '.join(f"`{c['name']}`" for c in config['columns'])
+            placeholders = ', '.join(["REPEAT('x', %s)"] * len(config['columns']))
+            self.insert_sql = f'INSERT INTO {self.table} (`createdby`, {names}) VALUES (@@hostname, {placeholders})'
         for key in [f'worker-{i+1}' for i in range(config['threads'])] + ['fresh-login']:
             self.sessions[key] = dict(status='Waiting', successes=0, failures=0, connections=0,
                 hostname='', connection_id=None, latency_seconds=None, max_latency_seconds=0,
                 last_success_at='', last_failure_at='', last_error='', outage_active=False,
-                outage_seconds=None, max_outage_seconds=0, uncertain_commits=0)
+                outage_seconds=None, max_outage_seconds=0, uncertain_commits=0,
+                committed_rows=0, committed_batches=0)
+
+    def target(self, key, readonly=None):
+        if not self.config.get('servers'):
+            return self.config
+        with self.roles_lock:
+            if time.monotonic() - self.roles_sampled >= 1:
+                roles = discover_roles(self.config, open_connection)
+                with self.lock:
+                    self.roles = roles
+                self.roles_sampled = time.monotonic()
+            targets = role_targets(self.roles, self.kind == 'readonly' if readonly is None else readonly)
+            index = int(key.split('-')[-1]) - 1 if key.startswith('worker-') else 0
+            return dict(self.config, **{k: targets[index % len(targets)][k] for k in ('host', 'port')})
+
+    def check_role(self, con, readonly=None):
+        if self.config.get('servers'):
+            require_role(con, self.kind == 'readonly' if readonly is None else readonly)
 
     def event(self, key, event, detail=''):
         self.events.append(dict(timestamp_utc=now(), session=key, event=event, detail=detail))
@@ -87,15 +158,25 @@ class TestRun:
             threading.Thread(target=self.cancel_queries, daemon=True).start()
 
     def cancel_queries(self):
+        with self.lock:
+            targets = list({(c['host'], c['port']) for c in self.active_targets.values()})
+        if not targets:
+            targets = [(self.config['host'], self.config['port'])]
+        for host, port in targets:
+            self.cancel_target(dict(self.config, host=host, port=port))
+
+    def cancel_target(self, config):
         control = None
         try:
-            control = open_connection(self.config)
+            control = open_connection(config)
             with control.cursor() as cur:
                 cur.execute('SELECT @@server_uuid')
                 server_uuid = str(cur.fetchone()[0])
                 while True:
                     with self.lock:
-                        targets = [value for key, value in self.active.items() if key != 'fresh-login']
+                        targets = [value for key, value in self.active.items() if key != 'fresh-login'
+                                   and (self.active_targets.get(key, self.config)['host'],
+                                        self.active_targets.get(key, self.config)['port']) == (config['host'], config['port'])]
                         if not targets:
                             break
                         for connection_id, target_uuid in targets:
@@ -150,20 +231,25 @@ class TestRun:
             began, committing = time.monotonic(), False
             try:
                 if con is None:
-                    con = open_connection(self.config, long_query=not fresh and self.kind == 'readonly')
+                    target = self.target(key)
+                    con = open_connection(target, long_query=not fresh and self.kind == 'readonly')
+                    self.check_role(con)
                     with con.cursor() as cur:
                         cur.execute('SELECT @@hostname, CONNECTION_ID(), @@server_uuid')
                         hostname, connection_id, server_uuid = cur.fetchone()
                     with self.lock:
                         s = self.sessions[key]
                         s.update(hostname=hostname, connection_id=int(connection_id))
+                        s.update(host=target['host'], port=target['port'])
                         s['connections'] += 1
                         self.active[key] = (int(connection_id), str(server_uuid))
+                        self.active_targets[key] = target
                         self.event(key, 'connection_opened', f'{hostname}, connection {connection_id}')
                 if self.stop_event.is_set():
                     break
+                self.check_role(con)
                 with self.lock:
-                    self.sessions[key]['status'] = 'Connecting / SELECT 1' if fresh else 'Running transaction' if self.kind == 'primary' else 'Running SLEEP'
+                    self.sessions[key]['status'] = 'Connecting / SELECT 1' if fresh else 'Inserting batch' if self.kind == 'primary' else 'Running SLEEP'
                 with con.cursor() as cur:
                     if fresh:
                         cur.execute('SELECT 1')
@@ -174,17 +260,20 @@ class TestRun:
                             raise RuntimeError('SLEEP was interrupted')
                     else:
                         if not prepared:
-                            cur.execute(f'CREATE TABLE IF NOT EXISTS {self.table} (client_id VARCHAR(80) PRIMARY KEY, counter BIGINT NOT NULL, updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)) ENGINE=InnoDB')
+                            cur.execute(self.create_sql)
                             prepared = True
+                        # MySQL generates the full-width values with REPEAT; only
+                        # the widths travel over the connection for each row.
+                        widths = tuple(c['length'] for c in self.config['columns'])
+                        rows = [widths] * self.config['batch_size']
                         con.start_transaction()
-                        client_id = self.run_id + '-' + key
-                        cur.execute(f'INSERT INTO {self.table} (client_id,counter) VALUES (%s,0) ON DUPLICATE KEY UPDATE counter=counter', (client_id,))
-                        cur.execute(f'UPDATE {self.table} SET counter=counter+1 WHERE client_id=%s', (client_id,))
-                        cur.execute(f'SELECT counter FROM {self.table} WHERE client_id=%s', (client_id,))
-                        cur.fetchone()
+                        cur.executemany(self.insert_sql, rows)
                         committing = True
                         con.commit()
                         committing = False
+                        with self.lock:
+                            self.sessions[key]['committed_batches'] += 1
+                            self.sessions[key]['committed_rows'] += self.config['batch_size']
                 self.record(key, began)
             except Exception as exc:
                 if not self.stop_event.is_set() or committing:
@@ -210,6 +299,7 @@ class TestRun:
         # Serialize removal/close with KILL QUERY so an old ID cannot be reused.
         with self.lock:
             self.active.pop(key, None)
+            self.active_targets.pop(key, None)
             if con:
                 try:
                     con.close()
@@ -227,4 +317,11 @@ class TestRun:
             return dict(kind=self.kind, run_id=self.run_id, running=bool(self.thread and self.thread.is_alive()),
                 stopping=self.stop_event.is_set() and not self.stopped_at, started_at=self.started_at,
                 stopped_at=self.stopped_at, host=self.config['host'], port=self.config['port'],
-                sessions=sessions, events=list(self.events), cancel_error=self.cancel_error)
+                sessions=sessions, events=list(self.events), cancel_error=self.cancel_error,
+                roles=deepcopy(self.roles),
+                table=self.table, create_sql=self.create_sql,
+                batch_size=self.config.get('batch_size'), columns=self.config.get('columns', []),
+                committed_rows=sum(s['committed_rows'] for s in sessions.values()),
+                committed_batches=sum(s['committed_batches'] for s in sessions.values()),
+                rows_per_second=round(sum(s['committed_rows'] for s in sessions.values()) /
+                    max(.001, (self.stopped_clock or time.monotonic()) - self.started_clock), 2))
