@@ -65,6 +65,13 @@ sample interval and query timeouts. Uptime means server uptime; it is unavailabl
 while the cached connection is down. Events, selected table content, and LSN
 propagation are retained below the two status tables.
 
+Observer and Test Client inputs save automatically in the same browser, including
+server rows, username, interval, test endpoints, database, threads, sleep timer,
+loop pauses, table choices and active tab. **Save settings** also saves immediately.
+Values return when the dashboard is reopened at the same address, including
+after an app restart. Passwords are excluded and must be entered again. Restoring
+settings does not start observation or workloads. Browser storage must be enabled.
+
 The **Observer** and **Test Client** tabs share the dashboard. Switching tabs
 keeps observation and both workloads running. Test clients use the Observer
 setup credentials captured when each test starts; their endpoints are configured

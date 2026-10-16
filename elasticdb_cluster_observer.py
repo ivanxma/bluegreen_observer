@@ -273,6 +273,56 @@ setInterval(refreshTests,1000);refreshTests();
 </script>''')
 
 
+PAGE = PAGE.replace('<div class="tabs" role="tablist"', '<section class="config"><div class="actions" style="margin-top:0"><button id="saveSettings" type="button">Save settings</button><span id="settingsMessage" role="status" class="muted">Settings save automatically in this browser. Passwords are not saved.</span></div></section><div class="tabs" role="tablist"', 1)
+PAGE = PAGE.replace('</script>', r'''
+const settingsKey='elasticdb-observer-settings-v1';
+const settingsFields=['user','interval','primaryHost','primaryPort','primaryThreads','primaryDatabase','primaryPause','readonlyHost','readonlyPort','readonlyThreads','readonlySleep','readonlyPause'];
+let settingsTimer;
+function settingsMessage(text,bad=false){$('#settingsMessage').textContent=text;$('#settingsMessage').className=bad?'error':'muted'}
+function saveSettings(){
+ clearTimeout(settingsTimer);
+ try{
+  const fields=Object.fromEntries(settingsFields.map(id=>[id,$('#'+id).value]));
+  const tables=[...document.querySelectorAll('#tablepick input[type="checkbox"]')].map(input=>({name:input.value,checked:input.checked}));
+  const servers=[...document.querySelectorAll('.serverinput')].map(row=>({name:row.querySelector('.name').value,host:row.querySelector('.host').value,port:row.querySelector('.port').value}));
+  const settings={version:1,servers,fields,tables,activeTab:$('#testTab').getAttribute('aria-selected')==='true'?1:0};
+  localStorage.setItem(settingsKey,JSON.stringify(settings));
+  settingsMessage('Settings saved in this browser. Passwords are not saved.');
+ }catch(error){settingsMessage('Settings could not be saved. Check that browser storage is enabled.',true)}
+}
+function restoreSettings(){
+ try{
+  const raw=localStorage.getItem(settingsKey);if(raw===null)return;
+  const settings=JSON.parse(raw);
+  if(!settings||settings.version!==1||!Array.isArray(settings.servers)||settings.servers.length>16||!settings.fields||!Array.isArray(settings.tables))throw Error('Invalid saved settings');
+  if(settings.servers.some(s=>!s||typeof s.name!=='string'||typeof s.host!=='string'||typeof s.port!=='string'))throw Error('Invalid saved servers');
+  if(settings.tables.length>2000||settings.tables.some(t=>!t||typeof t.name!=='string'||!/^[A-Za-z0-9_]+$/.test(t.name)||typeof t.checked!=='boolean'))throw Error('Invalid saved tables');
+  $('#serverInputs').replaceChildren();
+  for(const server of settings.servers)addServer(server.name,server.host,server.port);
+  for(const id of settingsFields)if(typeof settings.fields[id]==='string')$('#'+id).value=settings.fields[id];
+  if(settings.tables.length)$('#tablepick').innerHTML=settings.tables.map(t=>`<label><input type="checkbox" value="${esc(t.name)}"${t.checked?' checked':''}> ${esc(t.name)}</label>`).join('');
+  selectToolTab(settings.activeTab===1?1:0);
+  settingsMessage('Saved settings restored. Enter your password before starting.');
+ }catch(error){settingsMessage('Saved settings could not be restored. You can enter and save new settings.',true)}
+}
+restoreSettings();
+$('#saveSettings').onclick=saveSettings;
+function settingsInput(target){return target.matches('#serverInputs input, #tablepick input')||settingsFields.includes(target.id)}
+document.addEventListener('input',event=>{if(settingsInput(event.target)){clearTimeout(settingsTimer);settingsTimer=setTimeout(saveSettings,300)}});
+document.addEventListener('change',event=>{if(settingsInput(event.target))saveSettings()});
+document.addEventListener('click',event=>{if(event.target.closest('#addServer, .serverinput button, [role="tab"]'))saveSettings()});
+window.addEventListener('pagehide',()=>{if(settingsTimer)saveSettings()});
+// Retain the selected tables when discovery refreshes the available choices.
+const discoverWithSettings=$('#discover').onclick;
+$('#discover').onclick=async()=>{
+ const selected=new Set([...document.querySelectorAll('#tablepick input:checked')].map(input=>input.value));
+ await discoverWithSettings();
+ for(const input of document.querySelectorAll('#tablepick input'))input.checked=selected.has(input.value);
+ saveSettings();
+};
+</script>''')
+
+
 @app.post('/api/tests/<kind>/start')
 def start_test(kind):
     data = request.get_json(silent=True)
