@@ -65,6 +65,36 @@ sample interval and query timeouts. Uptime means server uptime; it is unavailabl
 while the cached connection is down. Events, selected table content, and LSN
 propagation are retained below the two status tables.
 
+The **Observer** and **Test Client** tabs share the dashboard. Switching tabs
+keeps observation and both workloads running. Test clients use the Observer
+setup credentials captured when each test starts; their endpoints are configured
+separately and they can run together. Stopping a test does not stop observation,
+and stopping the observer does not stop the tests.
+
+- **Test 1 — Primary VIP transactions:** specify the VIP, port, threads (1–64),
+  existing test database and loop pause. Each persistent worker repeatedly
+  inserts its counter row, updates it, reads it and commits. The client creates
+  `elastic_observer_test` in that database; the account needs CREATE, SELECT,
+  INSERT and UPDATE. One row per worker per run remains after stopping.
+- **Test 2 — Read-only long queries:** specify the read-only endpoint, port,
+  threads, sleep timer (0.1–3600 seconds) and loop pause. Each worker reuses its
+  session for repeated `SELECT SLEEP(...)`. Stop attempts to interrupt active
+  queries using a separate same-account connection on the same backend. If
+  cancellation cannot reach that backend, the query finishes or times out before
+  the worker stops. Primary transactions finish their current attempt on Stop.
+
+Each test also opens a fresh login and runs SELECT 1 every second independently
+of its persistent workload. Per-session results include the backend hostname,
+connection ID, completed operations, failures, connections, reconnects, last/max
+operation latency, last/max interruption, UTC success/failure times and errors.
+UTC events retain the latest 500 entries per test. Interrupted COMMIT replies
+are counted as uncertain commits because the server may have committed even
+though the client did not receive confirmation. Interruption is measured from
+the start of a failed operation until a subsequent successful operation and
+includes query and retry delays; it is sampled client impact rather than an
+exact server outage. Workload connections retry after failures and continue
+until Stop. Test state and results are held in memory and reset on app restart.
+
 Run the test suite with:
 
 ```bash

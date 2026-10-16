@@ -3,7 +3,7 @@
 
 Run: python elasticdb_cluster_observer.py (http://127.0.0.1:5052).
 Shared server sampling, events, table reads and LSN tracking live in
-mysql_multi_observer.py. This observer never changes database state.
+mysql_multi_observer.py. Observation is read-only; the optional primary test client writes to its test table.
 """
 from __future__ import annotations
 
@@ -16,6 +16,8 @@ from typing import Any
 
 from flask import Flask, jsonify, request
 
+from elasticdb_test_client import TestRun, config_from_json
+
 from mysql_multi_observer import (
     IDENTIFIER, ROW_LIMIT, MultiMonitor, PAGE as MULTI_PAGE,
     ServerSample, connect, now, tables_for,
@@ -24,6 +26,7 @@ from mysql_multi_observer import (
 app = Flask(__name__)
 app_lock = threading.Lock()
 monitor: ElasticDBClusterMonitor | None = None
+test_runs: dict[str, TestRun] = {}
 
 
 def airglow_attributes(cur: Any) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
@@ -229,6 +232,82 @@ function cachedTable(servers){return attributeTable(servers,[
 PAGE = PAGE.replace("$('#servers').innerHTML=data.servers.map(serverCard).join('');",
                     "$('#servers').innerHTML=serverTable(data.servers);$('#cachedServers').innerHTML=cachedTable(data.cached_servers||[]);")
 PAGE = PAGE.replace('Load tables to select what to monitor.', 'Optionally load tables to select what to monitor.')
+
+
+PAGE = PAGE.replace('<main>', '<main><div class="tabs" role="tablist" aria-label="Cluster tools"><button id="observerTab" role="tab" class="active" aria-selected="true" aria-controls="observerView">Observer</button><button id="testTab" role="tab" aria-selected="false" aria-controls="testView" tabindex="-1">Test Client</button></div><div id="observerView" role="tabpanel" aria-labelledby="observerTab">')
+PAGE = PAGE.replace('</main>', r'''</div><div id="testView" role="tabpanel" aria-labelledby="testTab" hidden>
+<section class="panel"><h2>Test Client</h2><p>Both tests loop until their Stop button is clicked. Observer sampling continues independently in either tab.</p>
+<p>Uses the MySQL user and password from Observer setup at Start. Configure the Primary VIP and read-only endpoint separately below.</p>
+<p>Test 1 creates <code>elastic_observer_test</code> in your existing test database and keeps one counter row per worker per run. Requires CREATE, SELECT, INSERT and UPDATE privileges. Rows remain after Stop.</p>
+<p>Test 2 keeps each session open for repeated <code>SELECT SLEEP(seconds)</code> queries. Stop interrupts the queries with a separate same-account connection.</p>
+<p class="muted">Each test also attempts a new login and SELECT 1 every second. Interruption runs from the start of the first failed operation to a successful operation; query time and retry delays are included. This is sampled client impact, not an exact server outage. Failed COMMIT replies are counted as uncertain outcomes.</p>
+<p id="testMessage" role="status"></p></section>
+<div id="testCases"></div>
+</div></main>''')
+PAGE = PAGE.replace('</style>', '''
+[hidden]{display:none!important}.tabs{display:flex;gap:.3rem;border-bottom:1px solid #bac8d8;margin-bottom:1rem}.tabs button{border-radius:6px 6px 0 0}.tabs button.active{background:white;border-bottom-color:white;font-weight:700;margin-bottom:-1px}.primary{background:linear-gradient(#c74634,#a52e20)!important;border-color:#a52e20!important}.primary:disabled{background:#aeb5bc!important;border-color:#aeb5bc!important}.testcase{margin-top:1rem}.testresults{max-height:400px;overflow:auto;margin-top:1rem}.testresults table td{white-space:normal;min-width:100px}.testresults table td:last-child{min-width:200px}
+</style>''')
+PAGE = PAGE.replace('</script>', r'''
+const toolTabs=[$('#observerTab'),$('#testTab')];
+function selectToolTab(index){toolTabs.forEach((tab,i)=>{tab.classList.toggle('active',i===index);tab.setAttribute('aria-selected',String(i===index));tab.tabIndex=i===index?0:-1;$('#'+tab.getAttribute('aria-controls')).hidden=i!==index})}
+toolTabs.forEach((tab,i)=>{tab.onclick=()=>selectToolTab(i);tab.onkeydown=e=>{let index;if(e.key==='ArrowRight'||e.key==='ArrowLeft')index=1-i;else if(e.key==='Home')index=0;else if(e.key==='End')index=1;else return;e.preventDefault();selectToolTab(index);toolTabs[index].focus()}});
+$('#testCases').innerHTML=['primary','readonly'].map(kind=>`<section class="panel testcase"><h2>${kind==='primary'?'Test 1 · Primary VIP transactions':'Test 2 · Read-only long queries'}</h2><div class="formgrid">
+<div class="field"><label for="${kind}Host">${kind==='primary'?'Primary VIP':'Read-only node host'} *</label><input id="${kind}Host" required></div>
+<div class="field"><label for="${kind}Port">Port *</label><input id="${kind}Port" type="number" min="1" max="65535" value="3306"></div>
+<div class="field"><label for="${kind}Threads">Threads *</label><input id="${kind}Threads" type="number" min="1" max="64" value="1"></div>
+${kind==='primary'?'<div class="field"><label for="primaryDatabase">Test database *</label><input id="primaryDatabase" placeholder="Existing database"></div>':'<div class="field"><label for="readonlySleep">Sleep timer (seconds) *</label><input id="readonlySleep" type="number" min="0.1" max="3600" step="0.1" value="10"></div>'}
+<div class="field"><label for="${kind}Pause">Loop pause (seconds) *</label><input id="${kind}Pause" type="number" min="0.01" max="60" step="0.01" value="0.1"></div>
+</div><div class="actions"><button id="${kind}Start" class="primary">${kind==='primary'?'Start test client':'Test 2 · Start'}</button><button id="${kind}Stop" disabled>Stop</button><span id="${kind}State">Idle</span></div><div class="testresults" id="${kind}Results"></div><div class="testresults"><h3>Workload events (UTC, latest 500)</h3><table class="eventtable"><thead><tr><th>UTC time</th><th>Session</th><th>Event</th><th>Detail</th></tr></thead><tbody id="${kind}Events"></tbody></table></div></section>`).join('');
+function testMessage(text,bad=false){$('#testMessage').textContent=text;$('#testMessage').className=bad?'error':'ok'}
+for(const kind of ['primary','readonly']){
+ $('#'+kind+'Start').onclick=async()=>{const button=$('#'+kind+'Start');button.disabled=true;try{const data={host:$('#'+kind+'Host').value,port:Number($('#'+kind+'Port').value),threads:Number($('#'+kind+'Threads').value),pause:Number($('#'+kind+'Pause').value),user:$('#user').value,password:$('#password').value,database:$('#primaryDatabase').value,sleep:Number($('#readonlySleep').value)};await api('/api/tests/'+kind+'/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});testMessage('Test started. Observer monitoring continues.');await refreshTests()}catch(e){testMessage(e.message,true);button.disabled=false}};
+ $('#'+kind+'Stop').onclick=async()=>{try{await api('/api/tests/'+kind+'/stop',{method:'POST'});await refreshTests()}catch(e){testMessage(e.message,true)}};
+}
+function renderTest(kind,run){const running=!!run?.running;$('#'+kind+'Start').disabled=running;$('#'+kind+'Stop').disabled=!running||run.stopping;$('#'+kind+'State').textContent=run?(run.stopping?'Stopping…':running?'Running':'Stopped')+' · '+run.host+':'+run.port:'Idle';if(!run)return;
+const columns=[['Session',(s,k)=>k],['Status',s=>s.status],['Backend / connection',s=>`${s.hostname||'—'} / ${s.connection_id??'—'}`],['Completed',s=>s.successes],['Failures',s=>s.failures],['Connections / reconnects',(s,k)=>`${s.connections} / ${k==='fresh-login'?'—':Math.max(0,s.connections-1)}`],['Last / max operation (s)',s=>`${s.latency_seconds??'—'} / ${s.max_latency_seconds}`],['Interruption / max (s)',s=>`${s.outage_seconds??'—'}${s.outage_active?' (ongoing)':''} / ${s.max_outage_seconds}`],['Last success (UTC)',s=>s.last_success_at||'—'],['Last failure (UTC)',s=>s.last_failure_at||'—'],['Uncertain commits',s=>s.uncertain_commits],['Last error',s=>s.last_error||'—']];
+$('#'+kind+'Results').innerHTML=`<p>Run started ${esc(run.started_at)}${run.stopped_at?' · Stopped '+esc(run.stopped_at):''}</p>${run.cancel_error?'<p class="error">Stop interruption error: '+esc(run.cancel_error)+'; waiting for the operation timeout.</p>':''}<table class="eventtable"><thead><tr>${columns.map(([label])=>'<th>'+label+'</th>').join('')}</tr></thead><tbody>${Object.entries(run.sessions).map(([key,s])=>'<tr>'+columns.map(([,value])=>'<td>'+esc(value(s,key))+'</td>').join('')+'</tr>').join('')}</tbody></table>`;
+$('#'+kind+'Events').innerHTML=[...run.events].reverse().map(e=>`<tr><td>${esc(e.timestamp_utc)}</td><td>${esc(e.session)}</td><td>${esc(e.event)}</td><td>${esc(e.detail)}</td></tr>`).join('')}
+let testsRefreshing=false;
+async function refreshTests(){if(testsRefreshing)return;testsRefreshing=true;try{const runs=await api('/api/tests/status');for(const kind of ['primary','readonly'])renderTest(kind,runs[kind])}catch(e){testMessage(e.message,true)}finally{testsRefreshing=false}}
+setInterval(refreshTests,1000);refreshTests();
+</script>''')
+
+
+@app.post('/api/tests/<kind>/start')
+def start_test(kind):
+    data = request.get_json(silent=True)
+    try:
+        if not isinstance(data, dict):
+            raise ValueError('Enter test connection settings.')
+        config = config_from_json(data, kind)
+    except (ValueError, TypeError, OverflowError) as exc:
+        return jsonify(error=str(exc)), 400
+    with app_lock:
+        current = test_runs.get(kind)
+        if current and current.thread and current.thread.is_alive():
+            return jsonify(error='This test is running or stopping.'), 409
+        current = TestRun(kind, config)
+        test_runs[kind] = current
+        current.start()
+    return jsonify(ok=True), 202
+
+
+@app.post('/api/tests/<kind>/stop')
+def stop_test(kind):
+    with app_lock:
+        current = test_runs.get(kind)
+        if not current:
+            return jsonify(error='No such test run.'), 404
+        if not current.stop_event.is_set():
+            current.stop()
+    return jsonify(ok=True), 202
+
+
+@app.get('/api/tests/status')
+def test_status():
+    with app_lock:
+        runs = dict(test_runs)
+    return jsonify({kind: run.snapshot() for kind, run in runs.items()})
 
 
 @app.get("/")
