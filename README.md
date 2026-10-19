@@ -1,5 +1,10 @@
 # Bluegreen Observer
 
+## Blue Green administration console
+
+The [MyApp web application](myapp/README.md) provides instance-principal OCI automation, a combined Blue/Green dashboard, HA conversion, Vault-backed credentials, GTID checks, work-request history, and scheduled-event review/restoration for creation and switchover.
+
+
 Local Flask dashboards for watching MySQL servers during an externally managed blue/green switchover, plus a separate write stress tool. The observer dashboards only query MySQL; none initiates or changes a switchover.
 
 ## Install
